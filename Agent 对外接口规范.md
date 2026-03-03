@@ -38,7 +38,7 @@ curl -X POST http://localhost:8191/api/v1/chat \
 ```
 {
   "session_id": "abc123",
-  "response": "为您找到海淀区3套房源...",
+  "response": "Agent回复内容",
   "status": "success",
   "tool_results": [
     {
@@ -51,3 +51,28 @@ curl -X POST http://localhost:8191/api/v1/chat \
   "duration_ms": 1500
 }
 ```
+response 字段说明
+|场景	|response |内容	|示例|
+|---|---|---|
+|普通对话	|自然语言文本	|"您好，请问有什么可以帮您？"|
+|房源查询完成后	|JSON 字符串	|"{\"message\": \"...\", \"houses\": [\"HF_2101\"]}"|
+
+房源查询返回格式
+当完成房源查询后，response 字段必须是合法的 JSON 字符串，包含以下字段：
+|字段	|类型	说明|
+|---|---|
+|message	|string	|给用户的回复说明|
+|houses	|array	|房源ID列表|
+
+示例
+```
+{
+"message": "为您找到以下符合条件的房源：",
+"houses": ["HF_4", "HF_6", "HF_277"]
+}
+```
+
+关键规则
+1、普通对话：直接输出自然语言文本
+2、房源查询完成后：response 必须是 JSON 字符串（需转义），包含 message 和 houses 字段
+3、JSON 字符串要求：必须是合法的 JSON，不能包含自然语言前缀

@@ -69,7 +69,7 @@ func NewAgentServer() *AgentServer {
 
 	baseURL := os.Getenv("FAKE_APP_BASE_URL")
 	if baseURL == "" {
-		baseURL = "http://7.225.29.223:8080"
+		baseURL = "http://7.221.6.201:8080"
 	}
 
 	return &AgentServer{
