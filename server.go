@@ -64,12 +64,12 @@ func NewAgentServer() *AgentServer {
 	if userID == "" {
 		// 为了防止误用，这里仍然要求显式配置
 		log.Println("warning: FAKE_APP_USER_ID not set, defaulting to demo-user (请在生产环境中配置真实工号)")
-		userID = "demo-user"
+		userID = "h00848321"
 	}
 
 	baseURL := os.Getenv("FAKE_APP_BASE_URL")
 	if baseURL == "" {
-		baseURL = "http://7.221.6.201:8080"
+		baseURL = "http://7.225.29.223:8080"
 	}
 
 	return &AgentServer{
@@ -391,7 +391,14 @@ func (s *AgentServer) searchHousesByPlatform(ctx context.Context, p SearchParams
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, ToolResult{
+			Name:    "get_houses_by_platform",
+			Success: false,
+			Error:   "read response body error: " + err.Error(),
+		}, err
+	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		err = fmt.Errorf("unexpected status %d from fake app api", resp.StatusCode)
@@ -578,4 +585,3 @@ func (s *AgentServer) buildUserFriendlyAnswer(originalMessage string, houses []H
 	sb.WriteString("\n\n如果你有更具体的要求（例如「预算再低一点」或「必须步行 10 分钟内到地铁」），可以继续告诉我，我可以在此基础上再帮你缩小范围。")
 	return sb.String()
 }
-
