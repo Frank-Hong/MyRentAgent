@@ -1,6 +1,5 @@
 package main
 
-import 
 import (
 	"context"
 	"encoding/json"
@@ -15,12 +14,52 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-) // ChatRequest 对应 Agent 对外接口规范中的请求体
-)// ChatRequest 对应 Agent 对外接口规范中的请求体
+	"time"
+)
+
+// ChatRequest 对应 Agent 对外接口规范中的请求体
 type ChatRequest struct {
 	ModelIP   string `json:"model_ip"`
 	SessionID string `json:"session_id"`
 	Message   string `json:"message"`
+}
+
+// ModelAPIRequest 对应模型API的请求体（OpenAI兼容格式）
+type ModelAPIRequest struct {
+	Model    string                   `json:"model"`
+	Messages []ModelAPIMessage        `json:"messages"`
+	Tools    []map[string]interface{} `json:"tools,omitempty"`
+	Stream   bool                     `json:"stream"`
+}
+
+// ModelAPIMessage 模型API消息结构
+type ModelAPIMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// ModelAPIResponse 对应模型API的响应体（OpenAI兼容格式）
+type ModelAPIResponse struct {
+	ID      string           `json:"id"`
+	Object  string           `json:"object"`
+	Created int64            `json:"created"`
+	Model   string           `json:"model"`
+	Choices []ModelAPIChoice `json:"choices"`
+	Usage   ModelAPIUsage    `json:"usage"`
+}
+
+// ModelAPIChoice 模型API选择项
+type ModelAPIChoice struct {
+	Index        int             `json:"index"`
+	Message      ModelAPIMessage `json:"message"`
+	FinishReason string          `json:"finish_reason"`
+}
+
+// ModelAPIUsage 模型API使用情况
+type ModelAPIUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
 // ToolResult 用于在响应中记录一次外部工具 / API 调用情况
@@ -71,7 +110,7 @@ func NewAgentServer() *AgentServer {
 
 	baseURL := os.Getenv("FAKE_APP_BASE_URL")
 	if baseURL == "" {
-		baseURL = "http://7.221.6.201:8080"
+		baseURL = "http://7.225.29.223:8080"
 	}
 
 	return &AgentServer{
@@ -201,6 +240,75 @@ func (s *AgentServer) initHouseData(ctx context.Context) *ToolResult {
 	return tr
 }
 
+// callModelAPI 调用模型API（OpenAI兼容接口）
+func (s *AgentServer) callModelAPI(ctx context.Context, modelIP, sessionID, userMessage string) (string, error) {
+	if modelIP == "" {
+		return "", fmt.Errorf("model_ip is empty")
+	}
+
+	// 构建请求URL
+	url := fmt.Sprintf("http://%s:8888/v1/chat/completions", modelIP)
+
+	// 构建请求体
+	reqBody := ModelAPIRequest{
+		Model: "", // 模型可以为空
+		Messages: []ModelAPIMessage{
+			{
+				Role:    "user",
+				Content: userMessage,
+			},
+		},
+		Stream: false,
+	}
+
+	// 序列化请求体
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal request body error: %w", err)
+	}
+
+	// 创建HTTP请求
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(jsonBody)))
+	if err != nil {
+		return "", fmt.Errorf("create request error: %w", err)
+	}
+
+	// 设置请求头
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Session-ID", sessionID)
+
+	// 发送请求
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("send request error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 读取响应体
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read response body error: %w", err)
+	}
+
+	// 检查HTTP状态码
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("unexpected status code %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	// 解析响应
+	var apiResp ModelAPIResponse
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		return "", fmt.Errorf("unmarshal response error: %w", err)
+	}
+
+	// 提取模型回复
+	if len(apiResp.Choices) == 0 {
+		return "", fmt.Errorf("no choices in response")
+	}
+
+	return apiResp.Choices[0].Message.Content, nil
+}
+
 // processUserMessage 根据用户自然语言做需求解析、房源查询与结果组织
 func (s *AgentServer) processUserMessage(ctx context.Context, req *ChatRequest, state *SessionState) (string, []ToolResult, error) {
 	message := strings.TrimSpace(req.Message)
@@ -209,15 +317,15 @@ func (s *AgentServer) processUserMessage(ctx context.Context, req *ChatRequest, 
 	}
 
 	// 简单意图判断：租房 / 退租 / 下架 / 找房 / 选择房源
+	lower := strings.ToLower(message)
 
-	
 	// 查找用户是否选择了某个房源（通过房源ID）
 	var selectedHouseID string
 	houseIDPattern := regexp.MustCompile(`HF_\d+`)
 	if matches := houseIDPattern.FindAllString(lower, -1); len(matches) > 0 {
 		selectedHouseID = matches[0]
+	}
 
-	
 	// 查找用户是否选择了房源（通过模糊描述）
 	if selectedHouseID == "" {
 		// 如果用户说"就租最近的那套"或类似的表达，选择排序后的第一套
@@ -227,13 +335,15 @@ func (s *AgentServer) processUserMessage(ctx context.Context, req *ChatRequest, 
 				selectedHouseID = state.RecentHouses[0].ID
 			}
 		}
+	}
 
-	
+	toolResults := make([]ToolResult, 0)
+
 	if selectedHouseID != "" {
 		// 用户选择房源，调用租房接口
 		rentTr := s.rentHouse(ctx, selectedHouseID)
+		toolResults = append(toolResults, *rentTr)
 
-		
 		if rentTr.Success {
 			// 租房成功，返回这个房源ID
 			return "好的，这套房源已经为您成功租下！", toolResults, nil
@@ -241,14 +351,14 @@ func (s *AgentServer) processUserMessage(ctx context.Context, req *ChatRequest, 
 			// 租房失败
 			return fmt.Sprintf("对不起，租房操作失败：%s", rentTr.Error), toolResults, nil
 		}
+	}
 
-	
 	// 查找用户是否在询问其他房源
 	if strings.Contains(lower, "其他") && (strings.Contains(lower, "房源") || strings.Contains(lower, "房子")) {
 		// 用户询问是否有符合条件的房源，返回没有
 		return "很抱歉，当前没有其他符合条件的房源了。", nil, nil
+	}
 
-	
 	// 默认视为"找房"意图
 	params := s.extractSearchParams(message)
 
@@ -267,19 +377,42 @@ func (s *AgentServer) processUserMessage(ctx context.Context, req *ChatRequest, 
 	}
 
 	// 使用用户需求对房源进行评分和排序，选择最匹配的房源
+	topHouses := s.scoreAndRankHouses(houses, params)
 
-	
 	// 更新session状态中的最近房源记录，用于处理后续的模糊租房指令
 	if len(topHouses) > 0 {
 		state.RecentHouses = topHouses
+	}
 
-	
-	// 房源查询完成后，返回JSON格式响应，包含message和houses字段
-	resp := s.buildJSONResponse(message, topHouses)
-	return resp, newToolResults, nil
-字
+	// 如果提供了model_ip，尝试调用模型API生成更自然的回复
+	var finalResponse string
+	if req.ModelIP != "" {
+		// 构建房源信息字符串，供模型参考
+		houseInfo := s.buildHouseInfoForModel(topHouses)
+
+		// 构建给模型的提示词
+		prompt := fmt.Sprintf("用户需求：%s\n\n查询到的房源信息：\n%s\n\n请根据用户需求和房源信息，用友好的语气回复用户，推荐最合适的房源。回复要简洁明了，突出房源的优势。如果房源较多，只推荐前3套最合适的。", message, houseInfo)
+
+		// 调用模型API
+		modelResponse, err := s.callModelAPI(ctx, req.ModelIP, req.SessionID, prompt)
+		if err != nil {
+			// 模型调用失败，使用默认回复
+			log.Printf("call model api error: %v, using default response", err)
+			finalResponse = s.buildJSONResponse(message, topHouses)
+		} else {
+			// 模型调用成功，使用模型生成的回复
+			finalResponse = s.buildJSONResponseWithModelMessage(message, topHouses, modelResponse)
+		}
+	} else {
+		// 没有提供model_ip，使用默认回复
+		finalResponse = s.buildJSONResponse(message, topHouses)
+	}
+
+	return finalResponse, newToolResults, nil
 }
+
 // SearchParams 映射到 /api/houses/by_platform 的部分查询参数
+type SearchParams struct {
 	ListingPlatform string
 	Districts       []string
 	Areas           []string
@@ -291,7 +424,6 @@ func (s *AgentServer) processUserMessage(ctx context.Context, req *ChatRequest, 
 	CommuteToXQMax  int
 	PageSize        int
 
-	
 	Decorations     []string // 装修要求：简装、精装、豪华、毛坯等
 	Orientations    []string // 朝向要求：朝南、朝北、朝东、朝西等
 	MinBathrooms    int      // 最少卫生间数量
@@ -301,14 +433,11 @@ func (s *AgentServer) processUserMessage(ctx context.Context, req *ChatRequest, 
 	TagsMustNotHave []string // 不能包含的标签
 	MinTags         int      // 最少标签数量
 
-	
 	PricePriority  bool // 价格是否为主要考量因素
 	SubwayPriority bool // 地铁距离是否为主要考量因素
 
-	
 	SortBy    string // 排序字段：price/area/subway
 	SortOrder string // 排序顺序：asc/desc
-	SortOrder          string    // 排序顺序：asc/desc
 }
 
 // extractSearchParams 使用语义分析从中文话术里解析更全面的筛选条件
@@ -410,14 +539,13 @@ func (s *AgentServer) extractSearchParams(message string) SearchParams {
 	}
 
 	// 装修要求：简装、精装、豪华、毛坯
-		"简装":   "简装",
-		"精装":   "精装",
-		"精装修":  "精装",
-		"豪华":   "豪华",
-		"豪华": "豪华",
-		"毛坯":   "毛坯",
-		"空房":   "空房",
-		"空房": "空房",
+	decorationsMap := map[string]string{
+		"简装":  "简装",
+		"精装":  "精装",
+		"精装修": "精装",
+		"豪华":  "豪华",
+		"毛坯":  "毛坯",
+		"空房":  "空房",
 	}
 	for k, v := range decorationsMap {
 		if strings.Contains(message, k) {
@@ -426,14 +554,13 @@ func (s *AgentServer) extractSearchParams(message string) SearchParams {
 	}
 
 	// 朝向要求：朝南、朝北、朝东、朝西、南北、东西
+	orientationsMap := map[string]string{
 		"朝南":   "朝南",
 		"朝北":   "朝北",
 		"朝东":   "朝东",
 		"朝西":   "朝西",
 		"南北":   "南北",
-		"南北": "南北",
 		"东西":   "东西",
-		"东西": "东西",
 		"东西通透": "东西",
 	}
 	for k, v := range orientationsMap {
@@ -468,29 +595,29 @@ func (s *AgentServer) extractSearchParams(message string) SearchParams {
 
 	// 噪音要求
 	noiseLevels := []string{"安静", "中等", "吵闹", "临街"}
+	for _, level := range noiseLevels {
 		if strings.Contains(message, level+"尽量") || strings.Contains(message, level+"为佳") ||
 			strings.Contains(message, "噪音"+level) || strings.Contains(message, "环境"+level) {
-		   strings.Contains(message, "噪音"+level) || strings.Contains(message, "环境"+level) {
 			p.MaxNoiseLevel = level
 			break
 		}
 	}
 
+	// 正面标签要求
 	positiveTags := []string{"近地铁", "双地铁", "多地铁", "精装修", "豪华装修", "朝南", "南北通透",
 		"采光好", "有电梯", "高楼层", "高层", "核心区", "学区房", "近高校", "高性价比"}
-	                        "采光好", "有电梯", "高楼层", "高层", "核心区", "学区房", "近高校", "高性价比"}
+	for _, tag := range positiveTags {
 		if strings.Contains(message, tag+"要求") || strings.Contains(message, "必须"+tag) ||
 			strings.Contains(message, "要有"+tag) {
-		   strings.Contains(message, "要有"+tag) {
 			p.TagsMustHave = append(p.TagsMustHave, tag)
 		}
 	}
 
 	// 负面标签排除
 	negativeTags := []string{"临街", "吵闹", "毛坯", "低价", "农村房", "农村自建房"}
+	for _, tag := range negativeTags {
 		if strings.Contains(message, "不要"+tag) || strings.Contains(message, "排除"+tag) ||
 			strings.Contains(message, "不能"+tag) {
-		   strings.Contains(message, "不能"+tag) {
 			p.TagsMustNotHave = append(p.TagsMustNotHave, tag)
 		}
 	}
@@ -502,23 +629,20 @@ func (s *AgentServer) extractSearchParams(message string) SearchParams {
 
 	if strings.Contains(message, "价格第一") || strings.Contains(message, "优先考虑价格") ||
 		strings.Contains(message, "实惠优先") || strings.Contains(message, "经济实惠") {
-	   strings.Contains(message, "实惠优先") || strings.Contains(message, "经济实惠") {
 		p.PricePriority = true
 	}
 	// 地铁优先级
 	if strings.Contains(message, "地铁第一") || strings.Contains(message, "地铁最重要") ||
 		strings.Contains(message, "地铁优先") {
-	   strings.Contains(message, "地铁优先") {
 		p.SubwayPriority = true
 	}
 
 	if strings.Contains(message, "按地铁距离") || strings.Contains(message, "按距离") ||
 		strings.Contains(message, "按地铁站") || strings.Contains(message, "按地铁") {
-	   strings.Contains(message, "按地铁站") || strings.Contains(message, "按地铁") {
 		p.SortBy = "subway"
+	}
 	if strings.Contains(message, "按价格") || strings.Contains(message, "按租金") ||
 		strings.Contains(message, "按价位") {
-	   strings.Contains(message, "按价位") {
 		p.SortBy = "price"
 	}
 	if strings.Contains(message, "按面积") {
@@ -527,11 +651,10 @@ func (s *AgentServer) extractSearchParams(message string) SearchParams {
 
 	if strings.Contains(message, "从近到远") || strings.Contains(message, "从少到多") ||
 		strings.Contains(message, "从小到大") || strings.Contains(message, "从低到高") {
-	   strings.Contains(message, "从小到大") || strings.Contains(message, "从低到高") {
 		p.SortOrder = "asc"
+	}
 	if strings.Contains(message, "从远到近") || strings.Contains(message, "从多到少") ||
 		strings.Contains(message, "从大到小") || strings.Contains(message, "从高到低") {
-	   strings.Contains(message, "从大到小") || strings.Contains(message, "从高到低") {
 		p.SortOrder = "desc"
 	}
 
@@ -539,10 +662,10 @@ func (s *AgentServer) extractSearchParams(message string) SearchParams {
 }
 
 // HouseScore 结构体用于房源匹配度评分
+type HouseScore struct {
 	HouseID string
 	Score   float64            // 综合匹配度分数
 	Factors map[string]float64 // 各个维度的单独分数
-	Factors      map[string]float64 // 各个维度的单独分数
 }
 
 // HouseResult 只保留生成文案需要的字段
@@ -748,8 +871,8 @@ func (s *AgentServer) scoreAndRankHouses(houses []HouseResult, params SearchPara
 	}
 
 	// 首先进行硬性要求筛选
+	filteredHouses := s.filterByStrictRequirements(houses, params)
 
-	
 	// 如果硬性要求筛选后没有房源，检查是否完全符合要求
 	if len(filteredHouses) == 0 {
 		// 检查是否有房源完全匹配用户的关键要求
@@ -760,8 +883,8 @@ func (s *AgentServer) scoreAndRankHouses(houses []HouseResult, params SearchPara
 		return filteredHouses // 返回空列表，表示没有完全符合要求的房源
 	}
 
+	scores := make([]HouseScore, 0, len(filteredHouses))
 
-	
 	for _, house := range filteredHouses {
 		scoredHouse := HouseScore{
 			HouseID: house.ID,
@@ -785,15 +908,14 @@ func (s *AgentServer) scoreAndRankHouses(houses []HouseResult, params SearchPara
 		// 3. 房屋配置匹配度评分 (权重: 25%)，只有在有配置要求时才计算
 		if len(params.Bedrooms) > 0 || params.RentalType != "" || len(params.Decorations) > 0 ||
 			len(params.Orientations) > 0 || params.HasElevator || params.MinBathrooms > 0 {
-		   len(params.Orientations) > 0 || params.HasElevator || params.MinBathrooms > 0 {
 			configScore := s.calculateConfigScore(house, params)
 			scoredHouse.Score += configScore * 0.25
 			scoredHouse.Factors["config"] = configScore
 		}
 
+		// 4. 隐藏信息匹配度评分 (权重: 20%)，只有在有隐藏信息要求时才计算
 		if params.MaxNoiseLevel != "" || len(params.TagsMustHave) > 0 || len(params.TagsMustNotHave) > 0 ||
 			params.MinTags > 0 {
-		   params.MinTags > 0 {
 			hiddenInfoScore := s.calculateHiddenInfoScore(house, params)
 			scoredHouse.Score += hiddenInfoScore * 0.20
 			scoredHouse.Factors["hidden_info"] = hiddenInfoScore
@@ -823,8 +945,8 @@ func (s *AgentServer) scoreAndRankHouses(houses []HouseResult, params SearchPara
 
 	// 创建排序后的房源列表供选择
 	sortedHouses := make([]HouseResult, len(filteredHouses))
+	copy(sortedHouses, filteredHouses)
 
-	
 	// 根据用户指定的排序方式进行排序
 	if params.SortBy == "subway" {
 		sort.Slice(sortedHouses, func(i, j int) bool {
@@ -842,15 +964,14 @@ func (s *AgentServer) scoreAndRankHouses(houses []HouseResult, params SearchPara
 		houseScoreMap := make(map[string]float64)
 		for _, score := range scores {
 			houseScoreMap[score.HouseID] = score.Score
+		}
 
-		
 		sort.Slice(sortedHouses, func(i, j int) bool {
 			scoreI := houseScoreMap[sortedHouses[i].ID]
 			scoreJ := houseScoreMap[sortedHouses[j].ID]
 			return scoreI > scoreJ
 		})
-
-	
+	}
 	// 选择前5个房源作为推荐结果
 	topCount := min(5, len(sortedHouses))
 	return sortedHouses[:topCount]
@@ -858,22 +979,22 @@ func (s *AgentServer) scoreAndRankHouses(houses []HouseResult, params SearchPara
 
 // filterByStrictRequirements 根据硬性要求筛选房源
 func (s *AgentServer) filterByStrictRequirements(houses []HouseResult, params SearchParams) []HouseResult {
+	filtered := make([]HouseResult, 0, len(houses))
 
-	
 	for _, house := range houses {
 		// 检查租赁类型硬性要求
 		if params.RentalType != "" && house.RentalType != params.RentalType {
 			continue
+		}
 
-		
 		// 检查价格硬性要求
 		if params.MinPrice > 0 && house.Price < float64(params.MinPrice) {
 			continue
 		}
 		if params.MaxPrice > 0 && house.Price > float64(params.MaxPrice) {
 			continue
+		}
 
-		
 		// 检查卧室数硬性要求
 		if len(params.Bedrooms) > 0 {
 			found := false
@@ -886,8 +1007,8 @@ func (s *AgentServer) filterByStrictRequirements(houses []HouseResult, params Se
 			if !found {
 				continue
 			}
+		}
 
-		
 		// 检查行政区硬性要求
 		if len(params.Districts) > 0 {
 			found := false
@@ -900,29 +1021,29 @@ func (s *AgentServer) filterByStrictRequirements(houses []HouseResult, params Se
 			if !found {
 				continue
 			}
+		}
 
-		
 		// 检查租房类型硬性要求（如果用户要求整租）
 		if params.RentalType == "整租" {
 			// 排除明显的合租房源（通常面积小，卧室数少）
 			if house.AreaSize < 50 && house.Bedrooms < 2 {
 				continue
 			}
+		}
 
-		
 		filtered = append(filtered, house)
+	}
 
-	
 	return filtered
 }
 
 // findStrictlyGoodMatches 找出相对较好的匹配选项（在无严格匹配时的备用方案）
 func (s *AgentServer) findStrictlyGoodMatches(houses []HouseResult, params SearchParams) []HouseResult {
+	goodMatches := make([]HouseResult, 0, len(houses))
 
-	
 	for _, house := range houses {
+		score := 0
 
-		
 		// 检查关键维度，每个维度+1分
 		if len(params.Districts) > 0 && house.District == params.Districts[0] {
 			score++
@@ -938,14 +1059,14 @@ func (s *AgentServer) findStrictlyGoodMatches(houses []HouseResult, params Searc
 		}
 		if params.RentalType != "" && house.RentalType == params.RentalType {
 			score++
+		}
 
-		
 		// 至少满足3个关键维度才认为是匹配的
 		if score >= 3 {
 			goodMatches = append(goodMatches, house)
 		}
+	}
 
-	
 	return goodMatches
 }
 
@@ -1107,8 +1228,8 @@ func (s *AgentServer) calculateConfigScore(house HouseResult, params SearchParam
 		}
 		if house.AreaSize > 120 {
 			estimatedBathrooms = 3
+		}
 
-		
 		if estimatedBathrooms >= params.MinBathrooms {
 			score += 0.1
 		}
@@ -1144,8 +1265,8 @@ func (s *AgentServer) calculateHiddenInfoScore(house HouseResult, params SearchP
 	if params.MaxNoiseLevel != "" {
 		noisePriority := map[string]int{"安静": 1, "中等": 2, "吵闹": 3, "临街": 4}
 		houseNoisePriority := noisePriority[house.NoiseLevel]
+		userMaxPriority := noisePriority[params.MaxNoiseLevel]
 
-		
 		if houseNoisePriority > 0 && houseNoisePriority <= userMaxPriority {
 			if houseNoisePriority == userMaxPriority {
 				score += 0.3 // 完全符合噪音要求
@@ -1158,11 +1279,6 @@ func (s *AgentServer) calculateHiddenInfoScore(house HouseResult, params SearchP
 	// 必须包含的标签
 	hasAllRequiredTags := true
 	if len(params.TagsMustHave) > 0 {
-		tagCounts := make(map[string]int)
-		for _, tag := range house.Tags {
-			tagCounts[tag]++
-
-		
 		for _, requiredTag := range params.TagsMustHave {
 			found := false
 			for _, houseTag := range house.Tags {
@@ -1176,8 +1292,8 @@ func (s *AgentServer) calculateHiddenInfoScore(house HouseResult, params SearchP
 				break
 			}
 		}
+	}
 
-	
 	if hasAllRequiredTags {
 		score += 0.3
 	}
@@ -1196,8 +1312,8 @@ func (s *AgentServer) calculateHiddenInfoScore(house HouseResult, params SearchP
 				break
 			}
 		}
+	}
 
-	
 	if !hasNegativeTags {
 		score += 0.2
 	}
@@ -1239,8 +1355,8 @@ func extractDistricts(message string) []string {
 // extractBedrooms 从消息中提取居室信息
 func extractBedrooms(message string) []string {
 	bedroomPattern := regexp.MustCompile(`(一居|1居|两居|2居|三居|3居|四居|4居)`)
+	matches := bedroomPattern.FindAllString(message, -1)
 
-	
 	// 转换数字格式
 	result := make([]string, 0, len(matches))
 	for _, match := range matches {
@@ -1333,7 +1449,6 @@ func (s *AgentServer) callRentAPI(ctx context.Context, houseID, listingPlatform 
 		}
 	}
 
-  
 	q := req.URL.Query()
 	q.Set("listing_platform", listingPlatform)
 	req.URL.RawQuery = q.Encode()
@@ -1387,8 +1502,7 @@ func (s *AgentServer) buildJSONResponse(originalMessage string, houses []HouseRe
 		responseData["summary_info"] = map[string]interface{}{
 			"districts": districtsFound,
 			"bedrooms":  bedroomsFound,
-
-		
+		}
 		if subwayDistFound > 0 {
 			responseData["summary_info"].(map[string]interface{})["subway_distance_max"] = subwayDistFound
 		}
@@ -1505,4 +1619,129 @@ func (s *AgentServer) buildUserFriendlyAnswer(originalMessage string, houses []H
 
 	sb.WriteString("\n\n如果你有更具体的要求（例如「预算再低一点」或「必须步行 10 分钟内到地铁」），可以继续告诉我，我可以在此基础上再帮你缩小范围。")
 	return sb.String()
+}
+
+// buildHouseInfoForModel 构建房源信息字符串，供模型参考
+func (s *AgentServer) buildHouseInfoForModel(houses []HouseResult) string {
+	var sb strings.Builder
+
+	if len(houses) == 0 {
+		return "没有找到符合条件的房源"
+	}
+
+	for i, h := range houses {
+		sb.WriteString(fmt.Sprintf("%d. 房源ID：%s\n", i+1, h.ID))
+		if h.Title != "" {
+			sb.WriteString(fmt.Sprintf("   标题：%s\n", h.Title))
+		}
+		if h.Community != "" {
+			sb.WriteString(fmt.Sprintf("   小区：%s\n", h.Community))
+		}
+		if h.District != "" || h.AreaName != "" {
+			sb.WriteString("   位置：")
+			if h.District != "" {
+				sb.WriteString(h.District)
+			}
+			if h.AreaName != "" {
+				if h.District != "" {
+					sb.WriteString("·")
+				}
+				sb.WriteString(h.AreaName)
+			}
+			sb.WriteString("\n")
+		}
+		if h.RentalType != "" {
+			sb.WriteString(fmt.Sprintf("   租赁方式：%s\n", h.RentalType))
+		}
+		if h.Bedrooms > 0 {
+			sb.WriteString(fmt.Sprintf("   卧室数：%d居\n", h.Bedrooms))
+		}
+		if h.AreaSize > 0 {
+			sb.WriteString(fmt.Sprintf("   面积：%.0f㎡\n", h.AreaSize))
+		}
+		if h.Price > 0 {
+			sb.WriteString(fmt.Sprintf("   租金：%.0f元/月\n", h.Price))
+		}
+		if h.SubwayStation != "" {
+			sb.WriteString(fmt.Sprintf("   地铁站：%s", h.SubwayStation))
+			if h.SubwayDistance > 0 {
+				sb.WriteString(fmt.Sprintf("（步行%d米）", h.SubwayDistance))
+			}
+			sb.WriteString("\n")
+		}
+		if h.CommuteToXierqiMin > 0 {
+			sb.WriteString(fmt.Sprintf("   到西二旗通勤：%d分钟\n", h.CommuteToXierqiMin))
+		}
+		if h.Decoration != "" {
+			sb.WriteString(fmt.Sprintf("   装修：%s\n", h.Decoration))
+		}
+		if h.Orientation != "" {
+			sb.WriteString(fmt.Sprintf("   朝向：%s\n", h.Orientation))
+		}
+		if h.NoiseLevel != "" {
+			sb.WriteString(fmt.Sprintf("   噪音水平：%s\n", h.NoiseLevel))
+		}
+		if len(h.Tags) > 0 {
+			sb.WriteString(fmt.Sprintf("   标签：%s\n", strings.Join(h.Tags, "、")))
+		}
+		sb.WriteString("\n")
+	}
+
+	return sb.String()
+}
+
+// buildJSONResponseWithModelMessage 使用模型生成的消息构建JSON响应
+func (s *AgentServer) buildJSONResponseWithModelMessage(originalMessage string, houses []HouseResult, modelMessage string) string {
+	// 提取房源ID列表
+	houseIDs := make([]string, 0, len(houses))
+	for _, house := range houses {
+		houseIDs = append(houseIDs, house.ID)
+	}
+
+	// 提取用户需求中的关键信息用于验证
+	districtsFound := extractDistricts(originalMessage)
+	bedroomsFound := extractBedrooms(originalMessage)
+	subwayDistFound := extractSubwayDistance(originalMessage)
+
+	// 构建响应数据
+	responseData := map[string]interface{}{
+		"message": modelMessage,
+		"houses":  houseIDs,
+	}
+
+	// 如果有关键信息，添加到响应中用于验证
+	if len(districtsFound) > 0 || len(bedroomsFound) > 0 {
+		responseData["summary_info"] = map[string]interface{}{
+			"districts": districtsFound,
+			"bedrooms":  bedroomsFound,
+		}
+		if subwayDistFound > 0 {
+			responseData["summary_info"].(map[string]interface{})["subway_distance_max"] = subwayDistFound
+		}
+	}
+
+	// 如果房子不为空，添加排序信息
+	if len(houses) > 0 {
+		responseData["sort_info"] = map[string]interface{}{
+			"subway_distance": fmt.Sprintf("%d米", houses[0].SubwayDistance),
+			"sort_order":      "asc",
+		}
+	}
+
+	// 转换为JSON字符串
+	jsonBytes, err := json.Marshal(responseData)
+	if err != nil {
+		// 如果JSON序列化失败，返回错误信息
+		errorResponse := map[string]interface{}{
+			"message": "抱歉，房源查询结果处理失败。",
+			"houses":  []string{},
+		}
+		if errorBytes, err := json.Marshal(errorResponse); err == nil {
+			return string(errorBytes)
+		}
+		// 如果连错误响应都无法序列化，返回最基本的格式
+		return `{"message":"抱歉，房源查询结果处理失败。","houses":[]}`
+	}
+
+	return string(jsonBytes)
 }
