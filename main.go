@@ -10,7 +10,7 @@ import (
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8191"
+		port = "8080"
 	}
 
 	server := NewAgentServer()
@@ -31,4 +31,3 @@ func main() {
 		log.Fatalf("server error: %v", err)
 	}
 }
-

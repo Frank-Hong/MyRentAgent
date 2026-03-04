@@ -110,7 +110,7 @@ func NewAgentServer() *AgentServer {
 
 	baseURL := os.Getenv("FAKE_APP_BASE_URL")
 	if baseURL == "" {
-		baseURL = "http://7.225.29.223:8080"
+		baseURL = "http://7.225.29.223:8191"
 	}
 
 	return &AgentServer{
@@ -125,6 +125,8 @@ func NewAgentServer() *AgentServer {
 
 // HandleChat 处理 /api/v1/chat 请求
 func (s *AgentServer) HandleChat(w http.ResponseWriter, r *http.Request) {
+	fmt.Printf("handleChat...\n")
+
 	start := time.Now()
 
 	if r.Method != http.MethodPost {
@@ -143,6 +145,9 @@ func (s *AgentServer) HandleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	fmt.Printf(req.ModelIP + "\n")
+	fmt.Printf(req.Message + "\n")
+
 	ctx := r.Context()
 
 	state := s.getOrCreateSession(req.SessionID)
@@ -160,6 +165,7 @@ func (s *AgentServer) HandleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reply, intentToolResults, err := s.processUserMessage(ctx, &req, state)
+	fmt.Printf(reply)
 	toolResults = append(toolResults, intentToolResults...)
 
 	duration := time.Since(start)
