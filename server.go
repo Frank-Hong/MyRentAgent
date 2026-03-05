@@ -26,10 +26,11 @@ type ChatRequest struct {
 
 // ModelAPIRequest 对应模型API的请求体（OpenAI兼容格式）
 type ModelAPIRequest struct {
-	Model    string                   `json:"model"`
-	Messages []ModelAPIMessage        `json:"messages"`
-	Tools    []map[string]interface{} `json:"tools,omitempty"`
-	Stream   bool                     `json:"stream"`
+	Model              string                   `json:"model"`
+	Messages           []ModelAPIMessage        `json:"messages"`
+	Tools              []map[string]interface{} `json:"tools,omitempty"`
+	Stream             bool                     `json:"stream"`
+	ChatTemplateKwargs map[string]interface{}   `json:"chat_template_kwargs,omitempty"`
 }
 
 // ModelAPIMessage 模型API消息结构
@@ -103,19 +104,17 @@ type AgentServer struct {
 func NewAgentServer() *AgentServer {
 	userID := os.Getenv("FAKE_APP_USER_ID")
 	if userID == "" {
-		// 为了防止误用，这里仍然要求显式配置
-		log.Println("warning: FAKE_APP_USER_ID not set, defaulting to demo-user (请在生产环境中配置真实工号)")
 		userID = "h00848321"
 	}
 
 	baseURL := os.Getenv("FAKE_APP_BASE_URL")
 	if baseURL == "" {
-		baseURL = "http://7.225.29.223:8191"
+		baseURL = "http://7.225.29.223:8080"
 	}
 
 	return &AgentServer{
 		httpClient: &http.Client{
-			Timeout: 8 * time.Second,
+			Timeout: 120 * time.Second, // 增加到120秒，适应大模型API调用
 		},
 		userID:         userID,
 		fakeAPIBaseURL: strings.TrimRight(baseURL, "/"),
@@ -125,8 +124,6 @@ func NewAgentServer() *AgentServer {
 
 // HandleChat 处理 /api/v1/chat 请求
 func (s *AgentServer) HandleChat(w http.ResponseWriter, r *http.Request) {
-	fmt.Printf("handleChat...\n")
-
 	start := time.Now()
 
 	if r.Method != http.MethodPost {
@@ -145,9 +142,6 @@ func (s *AgentServer) HandleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Printf(req.ModelIP + "\n")
-	fmt.Printf(req.Message + "\n")
-
 	ctx := r.Context()
 
 	state := s.getOrCreateSession(req.SessionID)
@@ -165,7 +159,7 @@ func (s *AgentServer) HandleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reply, intentToolResults, err := s.processUserMessage(ctx, &req, state)
-	fmt.Printf(reply)
+	fmt.Printf("[" + req.SessionID + "] [ response ]" + reply + "\n")
 	toolResults = append(toolResults, intentToolResults...)
 
 	duration := time.Since(start)
@@ -252,77 +246,297 @@ func (s *AgentServer) callModelAPI(ctx context.Context, modelIP, sessionID, user
 		return "", fmt.Errorf("model_ip is empty")
 	}
 
-	// 构建请求URL
-	url := fmt.Sprintf("http://%s:8888/v1/chat/completions", modelIP)
+	// 重试配置
+	maxRetries := 2
+	retryDelay := 3 * time.Second
 
-	// 构建请求体
-	reqBody := ModelAPIRequest{
-		Model: "", // 模型可以为空
-		Messages: []ModelAPIMessage{
-			{
-				Role:    "user",
-				Content: userMessage,
+	var lastErr error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			log.Printf("模型API调用失败，第%d次重试，错误: %v", attempt, lastErr)
+			time.Sleep(retryDelay)
+		}
+
+		// 构建请求URL
+		url := fmt.Sprintf("http://%s:8888/v1/chat/completions", modelIP)
+
+		// 构建请求体
+		reqBody := ModelAPIRequest{
+			Model: "", // 模型可以为空
+			Messages: []ModelAPIMessage{
+				{
+					Role:    "user",
+					Content: userMessage,
+				},
 			},
-		},
-		Stream: false,
+			Stream: false,
+			// 禁用思考模式，减少token消耗和响应时间
+			ChatTemplateKwargs: map[string]interface{}{
+				"enable_thinking": false,
+			},
+		}
+
+		// 序列化请求体
+		jsonBody, err := json.Marshal(reqBody)
+		if err != nil {
+			return "", fmt.Errorf("marshal request body error: %w", err)
+		}
+
+		// 创建HTTP请求
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(jsonBody)))
+		if err != nil {
+			lastErr = fmt.Errorf("create request error: %w", err)
+			continue
+		}
+
+		// 设置请求头
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Session-ID", sessionID)
+
+		// 发送请求
+		resp, err := s.httpClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("send request error: %w", err)
+			continue
+		}
+
+		// 读取响应体
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if err != nil {
+			lastErr = fmt.Errorf("read response body error: %w", err)
+			continue
+		}
+
+		// 检查HTTP状态码
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			// 401错误不重试（Session-ID问题）
+			if resp.StatusCode == 401 {
+				return "", fmt.Errorf("unexpected status code %d, body: %s", resp.StatusCode, string(body))
+			}
+			lastErr = fmt.Errorf("unexpected status code %d, body: %s", resp.StatusCode, string(body))
+			continue
+		}
+
+		// 解析响应
+		var apiResp ModelAPIResponse
+		if err := json.Unmarshal(body, &apiResp); err != nil {
+			lastErr = fmt.Errorf("unmarshal response error: %w", err)
+			continue
+		}
+
+		// 提取模型回复
+		if len(apiResp.Choices) == 0 {
+			lastErr = fmt.Errorf("no choices in response")
+			continue
+		}
+
+		// 成功返回
+		return apiResp.Choices[0].Message.Content, nil
 	}
 
-	// 序列化请求体
-	jsonBody, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", fmt.Errorf("marshal request body error: %w", err)
-	}
-
-	// 创建HTTP请求
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(jsonBody)))
-	if err != nil {
-		return "", fmt.Errorf("create request error: %w", err)
-	}
-
-	// 设置请求头
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Session-ID", sessionID)
-
-	// 发送请求
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("send request error: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// 读取响应体
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("read response body error: %w", err)
-	}
-
-	// 检查HTTP状态码
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("unexpected status code %d, body: %s", resp.StatusCode, string(body))
-	}
-
-	// 解析响应
-	var apiResp ModelAPIResponse
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return "", fmt.Errorf("unmarshal response error: %w", err)
-	}
-
-	// 提取模型回复
-	if len(apiResp.Choices) == 0 {
-		return "", fmt.Errorf("no choices in response")
-	}
-
-	return apiResp.Choices[0].Message.Content, nil
+	// 所有重试都失败
+	return "", fmt.Errorf("模型API调用失败，已重试%d次，最后错误: %w", maxRetries, lastErr)
 }
 
 // processUserMessage 根据用户自然语言做需求解析、房源查询与结果组织
 func (s *AgentServer) processUserMessage(ctx context.Context, req *ChatRequest, state *SessionState) (string, []ToolResult, error) {
 	message := strings.TrimSpace(req.Message)
 	if message == "" {
-		return "请描述一下你的租房需求，比如预算、区域、是否近地铁等。", nil, nil
+		return "您好！我是智能租房助手，我可以帮您查找合适的房源。请告诉我您的需求，比如预算、区域、是否近地铁等。", nil, nil
 	}
 
-	// 简单意图判断：租房 / 退租 / 下架 / 找房 / 选择房源
+	toolResults := make([]ToolResult, 0)
+
+	// 如果提供了model_ip，优先使用模型进行意图判断和对话
+	if req.ModelIP != "" {
+		return s.processWithModel(ctx, req, state, message)
+	}
+
+	// 没有提供model_ip，使用原有的规则引擎（保持向后兼容）
+	return s.processWithRules(ctx, req, state, message, toolResults)
+}
+
+// processWithModel 使用模型处理用户消息
+func (s *AgentServer) processWithModel(ctx context.Context, req *ChatRequest, state *SessionState, message string) (string, []ToolResult, error) {
+	toolResults := make([]ToolResult, 0)
+
+	// 优化：先使用规则快速判断是否是明显的房源查询，减少模型调用
+	lower := strings.ToLower(message)
+	isLikelyHouseSearch := s.isLikelyHouseSearch(lower)
+
+	if isLikelyHouseSearch {
+		// 明显是房源查询，直接执行查询，节省一次模型调用
+		log.Printf("用户消息: %s, 快速识别为房源查询，跳过意图识别", message)
+		return s.handleHouseSearch(ctx, req, state, message)
+	}
+
+	// 如果不是明显的房源查询，再调用模型判断意图
+	intentPrompt := fmt.Sprintf(`你是一个智能租房助手。请仔细分析用户的意图，只返回以下三个选项之一：
+1. "house_search" - 用户明确在询问房源、想租房、找房子、询问租房相关问题（如"我想找房子"、"帮我查一下房源"、"有什么房子吗"、"朝阳区两居室"、"预算5000"等）
+2. "rent_house" - 用户想租下某套房源（如"我要租这套"、"我就租这个"、"租HF_123"等，包含房源ID或明确的租房动作）
+3. "chat" - 用户只是打招呼、问好、闲聊、感谢、询问助手功能或其他非租房相关的问题（如"你好"、"谢谢"、"你能做什么"、"天气怎么样"、"押金怎么算"、"付款方式"等）
+
+判断标准：
+- 如果消息包含区域（朝阳/海淀/西城等）、户型（一居/两居/三居等）、预算（数字+元/千/万）、装修（精装/简装）、地铁/交通等关键词，返回house_search
+- 如果消息包含"租"、"要租"、"租下"等租房动作，且可能包含房源ID或指代词（这套/那个/第一套），返回rent_house
+- 如果只是聊天、询问政策、付款方式、押金等，返回chat
+
+用户消息：%s
+
+请只返回上述三个选项之一，不要返回其他内容，不要加引号。`, message)
+
+	intentResponse, err := s.callModelAPI(ctx, req.ModelIP, req.SessionID, intentPrompt)
+	if err != nil {
+		log.Printf("判断用户意图失败: %v，降级使用规则引擎", err)
+		// 降级：使用规则引擎处理
+		return s.processWithRules(ctx, req, state, message, toolResults)
+	}
+
+	intent := strings.TrimSpace(intentResponse)
+	intent = strings.Trim(intent, `'"`) // 移除可能的引号
+
+	log.Printf("用户消息: %s, 识别意图: %s", message, intent)
+
+	// 根据意图处理
+	switch intent {
+	case "house_search":
+		// 用户想找房，执行房源查询
+		return s.handleHouseSearch(ctx, req, state, message)
+
+	case "rent_house":
+		// 用户想租房，查找房源ID
+		lower := strings.ToLower(message)
+		houseIDPattern := regexp.MustCompile(`HF_\d+`)
+		var selectedHouseID string
+		if matches := houseIDPattern.FindAllString(lower, -1); len(matches) > 0 {
+			selectedHouseID = matches[0]
+		}
+
+		// 查找用户是否选择了房源（通过模糊描述）
+		if selectedHouseID == "" {
+			if strings.Contains(lower, "就租") && (strings.Contains(lower, "最近") || strings.Contains(lower, "第一") || strings.Contains(lower, "这套")) {
+				if len(state.RecentHouses) > 0 {
+					selectedHouseID = state.RecentHouses[0].ID
+				}
+			}
+		}
+
+		if selectedHouseID != "" {
+			// 用户选择房源，调用租房接口
+			rentTr := s.rentHouse(ctx, selectedHouseID)
+			toolResults = append(toolResults, *rentTr)
+
+			if rentTr.Success {
+				return "好的，这套房源已经为您成功租下！", toolResults, nil
+			} else {
+				return fmt.Sprintf("对不起，租房操作失败：%s", rentTr.Error), toolResults, nil
+			}
+		}
+
+		// 无法识别房源ID，让模型生成回复
+		chatPrompt := fmt.Sprintf("用户说：%s\n请友好地回复用户，告诉用户需要提供房源ID才能租房。", message)
+		chatResponse, err := s.callModelAPI(ctx, req.ModelIP, req.SessionID, chatPrompt)
+		if err != nil {
+			return "请问您想租哪套房源？请提供房源ID（如HF_123）。", toolResults, nil
+		}
+		return chatResponse, toolResults, nil
+
+	case "chat":
+		// 用户只是打招呼或闲聊，让模型回复
+		chatPrompt := fmt.Sprintf("你是一个友好的智能租房助手。用户说：%s\n请用自然的语气回复用户。如果用户只是打招呼，可以简单回应并主动询问是否需要帮忙找房子。回复要简洁友好。", message)
+		chatResponse, err := s.callModelAPI(ctx, req.ModelIP, req.SessionID, chatPrompt)
+		if err != nil {
+			return "您好！我是智能租房助手，我可以帮您查找合适的房源。请告诉我您的需求，比如预算、区域、是否近地铁等。", toolResults, nil
+		}
+		return chatResponse, toolResults, nil
+
+	default:
+		// 无法识别意图，降级使用规则引擎
+		log.Printf("无法识别意图: %s，降级使用规则引擎", intent)
+		return s.processWithRules(ctx, req, state, message, toolResults)
+	}
+}
+
+// isLikelyHouseSearch 快速判断是否是明显的房源查询
+func (s *AgentServer) isLikelyHouseSearch(message string) bool {
+	// 房源查询的关键词
+	houseSearchKeywords := []string{
+		"找房子", "找房", "查房", "租房", "租个", "租套",
+		"一居", "两居", "三居", "四居", "单间", "整租", "合租",
+		"朝阳", "海淀", "西城", "东城", "丰台", "通州", "大兴", "昌平", "房山", "石景山",
+		"精装", "简装", "豪华", "毛坯",
+		"地铁", "近地铁", "离地铁",
+		"预算", "以内", "以内", "左右", "元", "千", "万",
+		"链家", "安居客", "58",
+	}
+
+	// 检查是否包含房源查询关键词
+	for _, keyword := range houseSearchKeywords {
+		if strings.Contains(message, keyword) {
+			return true
+		}
+	}
+
+	// 检查是否包含数字（可能是预算或面积）
+	digitPattern := regexp.MustCompile(`\d+`)
+	if digitPattern.MatchString(message) {
+		// 如果包含数字，再检查是否有其他房源相关词汇
+		if strings.Contains(message, "房子") || strings.Contains(message, "房") || strings.Contains(message, "居室") {
+			return true
+		}
+	}
+
+	return false
+}
+
+// handleHouseSearch 处理房源搜索请求
+func (s *AgentServer) handleHouseSearch(ctx context.Context, req *ChatRequest, state *SessionState, message string) (string, []ToolResult, error) {
+	toolResults := make([]ToolResult, 0)
+
+	// 查找用户是否在询问其他房源
+	lower := strings.ToLower(message)
+	if strings.Contains(lower, "其他") && (strings.Contains(lower, "房源") || strings.Contains(lower, "房子")) {
+		return "很抱歉，当前没有其他符合条件的房源了。", toolResults, nil
+	}
+
+	// 提取搜索参数
+	params := s.extractSearchParams(message)
+
+	// 查询房源
+	houses, tr, err := s.searchHousesByPlatform(ctx, params)
+	if err != nil {
+		toolResults = append(toolResults, tr)
+		return "", toolResults, err
+	}
+	toolResults = append(toolResults, tr)
+
+	if len(houses) == 0 {
+		// 优化：没有找到房源，直接返回空列表，不调用模型
+		log.Printf("没有找到符合需求的房源: %s", message)
+		finalResponse := s.buildJSONResponse(message, []HouseResult{})
+		return finalResponse, toolResults, nil
+	}
+
+	// 使用用户需求对房源进行评分和排序，选择最匹配的房源
+	topHouses := s.scoreAndRankHouses(houses, params)
+
+	// 更新session状态中的最近房源记录
+	if len(topHouses) > 0 {
+		state.RecentHouses = topHouses
+	}
+
+	// 优化：直接返回JSON格式的房源列表，不调用模型生成回复
+	// 根据评分规则，重要的是返回正确的房源ID，而不是友好的文字回复
+	log.Printf("找到%d套房源，返回结果", len(topHouses))
+	finalResponse := s.buildJSONResponse(message, topHouses)
+	return finalResponse, toolResults, nil
+}
+
+// processWithRules 使用规则引擎处理用户消息（不使用模型）
+func (s *AgentServer) processWithRules(ctx context.Context, req *ChatRequest, state *SessionState, message string, toolResults []ToolResult) (string, []ToolResult, error) {
 	lower := strings.ToLower(message)
 
 	// 查找用户是否选择了某个房源（通过房源ID）
@@ -334,16 +548,12 @@ func (s *AgentServer) processUserMessage(ctx context.Context, req *ChatRequest, 
 
 	// 查找用户是否选择了房源（通过模糊描述）
 	if selectedHouseID == "" {
-		// 如果用户说"就租最近的那套"或类似的表达，选择排序后的第一套
 		if strings.Contains(lower, "就租") && (strings.Contains(lower, "最近") || strings.Contains(lower, "第一") || strings.Contains(lower, "这套")) {
-			// 这里需要在 session 中记录之前查询的房源，优先排序靠前的
 			if len(state.RecentHouses) > 0 {
 				selectedHouseID = state.RecentHouses[0].ID
 			}
 		}
 	}
-
-	toolResults := make([]ToolResult, 0)
 
 	if selectedHouseID != "" {
 		// 用户选择房源，调用租房接口
@@ -351,35 +561,30 @@ func (s *AgentServer) processUserMessage(ctx context.Context, req *ChatRequest, 
 		toolResults = append(toolResults, *rentTr)
 
 		if rentTr.Success {
-			// 租房成功，返回这个房源ID
 			return "好的，这套房源已经为您成功租下！", toolResults, nil
 		} else {
-			// 租房失败
 			return fmt.Sprintf("对不起，租房操作失败：%s", rentTr.Error), toolResults, nil
 		}
 	}
 
 	// 查找用户是否在询问其他房源
 	if strings.Contains(lower, "其他") && (strings.Contains(lower, "房源") || strings.Contains(lower, "房子")) {
-		// 用户询问是否有符合条件的房源，返回没有
-		return "很抱歉，当前没有其他符合条件的房源了。", nil, nil
+		return "很抱歉，当前没有其他符合条件的房源了。", toolResults, nil
 	}
 
-	// 默认视为"找房"意图
+	// 默认视为"找房"意图（规则引擎模式）
 	params := s.extractSearchParams(message)
 
-	var newToolResults []ToolResult
 	houses, tr, err := s.searchHousesByPlatform(ctx, params)
 	if err != nil {
-		newToolResults := []ToolResult{tr}
-		return "", newToolResults, err
+		toolResults = append(toolResults, tr)
+		return "", toolResults, err
 	}
-	newToolResults = append(newToolResults, tr)
+	toolResults = append(toolResults, tr)
 
 	if len(houses) == 0 {
-		// 仍然返回JSON格式，包含message和houses字段
 		resp := s.buildJSONResponse(message, []HouseResult{})
-		return resp, newToolResults, nil
+		return resp, toolResults, nil
 	}
 
 	// 使用用户需求对房源进行评分和排序，选择最匹配的房源
@@ -390,31 +595,9 @@ func (s *AgentServer) processUserMessage(ctx context.Context, req *ChatRequest, 
 		state.RecentHouses = topHouses
 	}
 
-	// 如果提供了model_ip，尝试调用模型API生成更自然的回复
-	var finalResponse string
-	if req.ModelIP != "" {
-		// 构建房源信息字符串，供模型参考
-		houseInfo := s.buildHouseInfoForModel(topHouses)
-
-		// 构建给模型的提示词
-		prompt := fmt.Sprintf("用户需求：%s\n\n查询到的房源信息：\n%s\n\n请根据用户需求和房源信息，用友好的语气回复用户，推荐最合适的房源。回复要简洁明了，突出房源的优势。如果房源较多，只推荐前3套最合适的。", message, houseInfo)
-
-		// 调用模型API
-		modelResponse, err := s.callModelAPI(ctx, req.ModelIP, req.SessionID, prompt)
-		if err != nil {
-			// 模型调用失败，使用默认回复
-			log.Printf("call model api error: %v, using default response", err)
-			finalResponse = s.buildJSONResponse(message, topHouses)
-		} else {
-			// 模型调用成功，使用模型生成的回复
-			finalResponse = s.buildJSONResponseWithModelMessage(message, topHouses, modelResponse)
-		}
-	} else {
-		// 没有提供model_ip，使用默认回复
-		finalResponse = s.buildJSONResponse(message, topHouses)
-	}
-
-	return finalResponse, newToolResults, nil
+	// 使用默认回复
+	finalResponse := s.buildJSONResponse(message, topHouses)
+	return finalResponse, toolResults, nil
 }
 
 // SearchParams 映射到 /api/houses/by_platform 的部分查询参数
